@@ -8,7 +8,7 @@ documentation = "https://docs.rs/hpm-riscv"
 homepage = "https://github.com/hpmicro-rs/hpm-riscv-rt"
 categories = ["embedded", "no-std", "hardware-support"]
 license = "MIT/Apache-2.0"
-version = "0.1.2"                                         # for rt and macros
+version = "0.3.0"
 edition = "2021"
 
 [package]
@@ -21,21 +21,26 @@ documentation.workspace = true
 homepage.workspace = true
 categories.workspace = true
 license.workspace = true
-description = "Low level access to HPMicro's RISC-V processors"
-keywords = ["hpmicro", "hpm", "riscv"]
+description = "Runtime support for HPMicro RISC-V MCUs"
+keywords = ["hpmicro", "hpm", "riscv", "runtime"]
 readme = "README.md"
+build = "build.rs"
 
 [dependencies]
-# andes-riscv = { version = "0.1.1", path = "../../andes-riscv" }
+riscv = { version = "0.15", features = ["critical-section-single-hart"] }
 andes-riscv = "0.1.2"
-hpm-riscv-rt-macros = { version = "0.1.2", path = "macros" }
+
+# Macros
+hpm-riscv-rt-macros = { version = "0.3.0", path = "macros" }
+
+[build-dependencies]
 
 [features]
 default = []
-
+# HPM6700 series errata workaround (ignore illegal instruction exception with mtval=0)
 hpm67-fix = []
-single-hart = []
-
+# Dual-core support (disables single-hart optimizations)
+dual-core = []
 
 [package.metadata.docs.rs]
 targets = ["riscv32imafc-unknown-none-elf"]

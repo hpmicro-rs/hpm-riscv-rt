@@ -1,101 +1,188 @@
 # hpm-riscv-rt
 
-Minimal startup/runtime for RISC-V CPUs from HPMicro.
+Runtime support for HPMicro RISC-V MCUs with Andes PLIC vectored interrupt mode.
 
-Much of the code in this package originated in the [rust-embedded/riscv] repository.
+## Features
 
-[rust-embedded/riscv]: https://github.com/rust-embedded/riscv
+- Complete startup code (`_hpm_start`) with RAM initialization
+- PLIC vectored interrupt support (hardware-accelerated interrupt dispatch)
+- L1 Cache initialization (I-Cache, D-Cache)
+- Fast code/data sections for ILM/DLM placement
+- Non-cacheable memory section support
+- Compatible with `riscv-rt` memory.x format (with HPMicro extensions)
 
-## How to use
+## Usage
 
-Create the `memory.x` linker script file, then add link args.
+### 1. Add dependency
+
+```toml
+[dependencies]
+hpm-riscv-rt = "0.2"
+```
+
+### 2. Configure linker scripts
+
+In `.cargo/config.toml`:
+
+```toml
+[target.riscv32imafc-unknown-none-elf]
+rustflags = [
+    "-C", "link-arg=-Tmemory.x",     # User-provided memory layout
+    "-C", "link-arg=-Tdevice.x",     # From hpm-metapac (__INTERRUPTS)
+    "-C", "link-arg=-Thpm-link.x",   # From hpm-riscv-rt
+]
+```
+
+### 3. Create `memory.x`
 
 ```ld
-
 MEMORY
 {
-    XPI0_HEADER : ORIGIN = 0x80000000, LENGTH = 0x3000 /* bootheader */
-    XPI0_APP    : ORIGIN = 0x80003000, LENGTH = 1024K - 0x3000 /* app firmware */
-
-    ILM        : ORIGIN = 0x00000000, LENGTH =  256K /* instruction local memory */
-    DLM        : ORIGIN = 0x00080000, LENGTH =  256K /* data local memory */
-
-    AXI_SRAM    : ORIGIN = 0x01080000, LENGTH = 1M
-    AHB_SRAM    : ORIGIN = 0xF0300000, LENGTH = 32K
-    APB_SRAM    : ORIGIN = 0xF40F0000, LENGTH = 8K
-
-    SDRAM       : ORIGIN = 0x40000000, LENGTH = 32M
+    XPI0_APP    : ORIGIN = 0x80003000, LENGTH = 1024K - 0x3000
+    ILM         : ORIGIN = 0x00000000, LENGTH = 128K
+    DLM         : ORIGIN = 0x00080000, LENGTH = 128K
+    AHB_SRAM    : ORIGIN = 0xF0400000, LENGTH = 32K
 }
 
-
+/* Standard regions (riscv-rt compatible) */
 REGION_ALIAS("REGION_TEXT", XPI0_APP);
-REGION_ALIAS("REGION_FASTTEXT", ILM);
-REGION_ALIAS("REGION_FASTDATA", DLM);
 REGION_ALIAS("REGION_RODATA", XPI0_APP);
 REGION_ALIAS("REGION_DATA", DLM);
 REGION_ALIAS("REGION_BSS", DLM);
 REGION_ALIAS("REGION_HEAP", DLM);
 REGION_ALIAS("REGION_STACK", DLM);
+
+/* HPMicro extensions */
+REGION_ALIAS("REGION_FASTTEXT", ILM);      /* Vector table + fast code */
+REGION_ALIAS("REGION_FASTDATA", DLM);      /* Fast data */
 REGION_ALIAS("REGION_NONCACHEABLE_RAM", DLM);
 ```
 
-## Re-exported macros
+### 4. Write your application
 
-<!-- intro to entry, fast, interrupt, pre_init >
+```rust
+#![no_std]
+#![no_main]
 
-### `entry!`
+use hpm_riscv_rt::{entry, pre_init, fast};
+
+#[entry]
+fn main() -> ! {
+    // Your application code
+    loop {}
+}
+```
+
+## Memory Regions
+
+| Region | Required | Description |
+|--------|----------|-------------|
+| `REGION_TEXT` | Yes | Code (.text) |
+| `REGION_RODATA` | Yes | Read-only data (.rodata) |
+| `REGION_DATA` | Yes | Initialized data (.data) |
+| `REGION_BSS` | Yes | Uninitialized data (.bss) |
+| `REGION_HEAP` | Yes | Heap memory |
+| `REGION_STACK` | Yes | Stack memory |
+| `REGION_FASTTEXT` | Yes | ILM - Vector table + fast code |
+| `REGION_FASTDATA` | Yes | DLM - Fast data |
+| `REGION_NONCACHEABLE_RAM` | Yes | Non-cacheable memory |
+| `AHB_SRAM` | Optional | AHB SRAM for DMA buffers |
+
+## Macros
+
+### `#[entry]`
+
+Declares the program entry point. Function must have signature `fn() -> !`.
 
 ```rust
 #[entry]
 fn main() -> ! {
-    loop {
-        // your code here
-    }
+    loop {}
 }
 ```
 
-Marks a function as the entry point of the program.
+### `#[pre_init]`
 
-### `fast!`
-
-```rust
-#[fast]
-fn fast_handler() {
-    // your code here
-}
-
-#[fast]
-static mut FAST_DATA: u32 = 0;
-
-#[fast]
-static FAST_DATA_INIT: MaybeUninit<u32> = MaybeUninit::uninit();
-```
-
-Marks a function as a fast interrupt handler, or a static as fast data.
-
-### `interrupt!`
-
-```rustp
-#[interrupt]
-fn GPIO0() {
-    // your code here
-}
-
-#[interrupt(MachineTimer)]
-fn timer() {
-    // your code here
-}
-```
-
-Marks a function as an interrupt handler, both core local and external.
-
-### `pre_init!`
+Declares a function to run before RAM initialization. Useful for disabling watchdog or configuring external RAM.
 
 ```rust
 #[pre_init]
-fn before_main() {
-    // your code here
+unsafe fn setup() {
+    // Runs before .data/.bss are initialized
+    // Stack is valid, interrupts are disabled
 }
 ```
 
-Marks a function that will be executed before `main`. Useful for setting up the environment(SDRAM, etc).
+### `#[fast]`
+
+Places functions in ILM (.fast.text) or statics in DLM (.fast.data/.fast.bss) for better performance.
+
+```rust
+#[fast]
+fn time_critical_function() {
+    // Runs from ILM (zero wait state)
+}
+
+#[fast]
+static mut BUFFER: [u8; 1024] = [0; 1024];  // In .fast.data (DLM)
+
+#[fast]
+static UNINIT: MaybeUninit<[u8; 4096]> = MaybeUninit::uninit();  // In .fast.bss
+```
+
+### `#[external_interrupt]`
+
+Declares an external interrupt handler for PLIC.
+
+```rust
+use hpm_riscv_rt::external_interrupt;
+
+#[external_interrupt(pac::interrupt::UART0)]
+fn uart0_handler() {
+    // Handle UART0 interrupt
+}
+```
+
+## Interrupt Handling
+
+HPMicro uses Andes PLIC vectored mode:
+
+- **Vector table** at 512-byte aligned address in ILM
+- **Entry 0** (`CORE_LOCAL`): Handles exceptions and core interrupts (MachineTimer, MachineSoft, etc.)
+- **Entry 1+**: Direct jump to PLIC external interrupt handlers
+
+Core interrupt handlers can be defined by exporting symbols:
+
+```rust
+#[no_mangle]
+extern "C" fn MachineTimer() {
+    // Handle machine timer interrupt
+}
+
+#[no_mangle]
+extern "C" fn MachineSoft() {
+    // Handle machine software interrupt (PLICSW)
+}
+```
+
+## Startup Sequence
+
+1. `_hpm_start` (assembly entry point)
+   - Initialize global pointer and stack pointer
+   - Set pre-init trap handler
+   - Call `__pre_init` hook
+   - Initialize .data, .bss, .fast sections
+2. `_hpm_start_rust` (Rust startup)
+   - Enable FPU
+   - Enable L1 Cache (I-Cache, D-Cache)
+   - Initialize non-cacheable sections
+   - Call `_setup_interrupts` (configure PLIC vectored mode)
+   - Jump to `main()`
+
+## Compatibility
+
+This crate is designed to work alongside `riscv-rt` (pulled in by `hpm-metapac/rt`). Symbol conflicts are avoided by using `_hpm_` prefix for startup symbols.
+
+## License
+
+MIT OR Apache-2.0

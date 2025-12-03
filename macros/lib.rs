@@ -1,107 +1,115 @@
-use proc_macro2::Span;
-use proc_macro_error::proc_macro_error;
-use syn::{
-    parse, parse_macro_input, spanned::Spanned, token, Abi, Expr, Ident, Item, ItemFn, LitStr,
-    ReturnType, Type, Visibility,
-};
+//! Procedural macros for hpm-riscv-rt
+//!
+//! This crate provides:
+//! - `#[entry]` - Define the program entry point
+//! - `#[pre_init]` - Define a pre-initialization function
+//! - `#[fast]` - Place functions/statics in ILM/DLM
+//! - `#[external_interrupt]` - Define PLIC external interrupt handlers
 
 use proc_macro::TokenStream;
-use quote::{quote, ToTokens};
+use quote::quote;
+use syn::{parse_macro_input, spanned::Spanned, Expr, Item, ItemFn, parse::Parse, parse::ParseStream};
 
+/// Attribute to declare the entry point of the program.
+///
+/// The function must have the signature `fn() -> !` (never returns).
+///
+/// # Example
+///
+/// ```ignore
+/// #[entry]
+/// fn main() -> ! {
+///     loop {}
+/// }
+/// ```
 #[proc_macro_attribute]
-pub fn entry(args: TokenStream, input: TokenStream) -> TokenStream {
+pub fn entry(_args: TokenStream, input: TokenStream) -> TokenStream {
     let f = parse_macro_input!(input as ItemFn);
 
-    // check the function arguments
-    if !f.sig.inputs.is_empty() {
-        return parse::Error::new(
-            f.sig.inputs.last().unwrap().span(),
-            "`#[entry]` function accepts no arguments",
-        )
-        .to_compile_error()
-        .into();
-    }
-
-    // check the function signature
-    let valid_signature = f.sig.constness.is_none()
-        && f.sig.asyncness.is_none()
-        && f.vis == Visibility::Inherited
-        && f.sig.abi.is_none()
-        && f.sig.generics.params.is_empty()
-        && f.sig.generics.where_clause.is_none()
-        && f.sig.variadic.is_none()
-        && match f.sig.output {
-            ReturnType::Default => false,
-            ReturnType::Type(_, ref ty) => matches!(**ty, Type::Never(_)),
-        };
-
-    if !valid_signature {
-        return parse::Error::new(
-            f.span(),
-            "`#[entry]` function must have signature `[unsafe] fn() -> !`",
-        )
-        .to_compile_error()
-        .into();
-    }
-
-    if !args.is_empty() {
-        return parse::Error::new(Span::call_site(), "This attribute accepts no arguments")
-            .to_compile_error()
-            .into();
-    }
-
-    // XXX should we blacklist other attributes?
-    let attrs = f.attrs;
-    let unsafety = f.sig.unsafety;
-    let args = f.sig.inputs;
-    let stmts = f.block.stmts;
+    let fn_attrs = &f.attrs;
+    let fn_vis = &f.vis;
+    let fn_sig = &f.sig;
+    let fn_block = &f.block;
 
     quote!(
-        #[allow(non_snake_case)]
-        #[export_name = "main"]
-        #(#attrs)*
-        pub #unsafety fn __hpm_riscv_v_rt__main(#args) -> ! {
-            #(#stmts)*
-        }
+        #(#fn_attrs)*
+        #[unsafe(export_name = "main")]
+        #fn_vis #fn_sig #fn_block
     )
     .into()
 }
 
-/// This attribute allows placing functions into ram.
+/// Attribute to declare a function that runs before RAM is initialized.
+///
+/// The function must have the signature `unsafe fn()`.
+/// At this point:
+/// - Stack is valid
+/// - .data and .bss are NOT initialized
+/// - Interrupts are disabled
+///
+/// # Example
+///
+/// ```ignore
+/// #[pre_init]
+/// unsafe fn setup_watchdog() {
+///     // Disable watchdog before RAM init
+/// }
+/// ```
 #[proc_macro_attribute]
-#[proc_macro_error]
+pub fn pre_init(_args: TokenStream, input: TokenStream) -> TokenStream {
+    let f = parse_macro_input!(input as ItemFn);
+
+    let fn_attrs = &f.attrs;
+    let fn_vis = &f.vis;
+    let fn_sig = &f.sig;
+    let fn_block = &f.block;
+
+    quote!(
+        #(#fn_attrs)*
+        #[unsafe(export_name = "__pre_init")]
+        #fn_vis #fn_sig #fn_block
+    )
+    .into()
+}
+
+/// Place a function or static into fast memory (ILM/DLM).
+///
+/// Functions are placed into `.fast.text` section (ILM).
+/// Statics are placed into `.fast.data` or `.fast.bss` section (DLM).
+///
+/// # Example
+///
+/// ```ignore
+/// use hpm_riscv_rt::fast;
+///
+/// #[fast]
+/// fn critical_function() {
+///     // This function runs from ILM
+/// }
+///
+/// #[fast]
+/// static BUFFER: [u8; 1024] = [0; 1024];
+/// ```
+#[proc_macro_attribute]
 pub fn fast(_args: TokenStream, input: TokenStream) -> TokenStream {
-    let f = parse_macro_input!(input as Item);
+    let item = parse_macro_input!(input as Item);
 
-    match f {
+    match item {
         Item::Fn(f) => {
-            let section = quote! {
-                #[link_section = ".fast.text"]
-                #[inline(never)] // make certain function is not inlined
-            };
-
             quote!(
-                #section
+                #[unsafe(link_section = ".fast.text")]
+                #[inline(never)]
                 #f
             )
             .into()
         }
         Item::Static(item) => {
-            let mut section = quote! {
-                #[link_section = ".fast.data"]
+            // Check if it's uninitialized (MaybeUninit::uninit())
+            let section = if is_uninit_expr(&item.expr) {
+                quote!(#[unsafe(link_section = ".fast.bss")])
+            } else {
+                quote!(#[unsafe(link_section = ".fast.data")])
             };
-
-            if let Expr::Call(c) = &*item.expr {
-                let s = format!("{}", c.into_token_stream());
-
-                if s.ends_with("MaybeUninit :: uninit()")
-                    || s.ends_with("MaybeUninit :: uninit_array()")
-                {
-                    section = quote! {
-                        #[link_section = ".fast.bss"]
-                    };
-                }
-            }
 
             quote!(
                 #section
@@ -110,184 +118,88 @@ pub fn fast(_args: TokenStream, input: TokenStream) -> TokenStream {
             .into()
         }
         _ => {
-            let msg = "expected function or static";
-            let span = f.span();
-            return syn::Error::new(span, msg).to_compile_error().into();
+            let span = item.span();
+            syn::Error::new(span, "#[fast] can only be applied to functions or statics")
+                .to_compile_error()
+                .into()
         }
     }
 }
 
-const CORE_INTERRUPTS: [&str; 6] = [
-    "SupervisorSoft",
-    "MachineSoft",
-    "SupervisorTimer",
-    "MachineTimer",
-    "SupervisorExternal",
-    "MachineExternal",
-];
+fn is_uninit_expr(expr: &Expr) -> bool {
+    if let Expr::Call(call) = expr {
+        let s = quote!(#call).to_string();
+        s.contains("MaybeUninit") && (s.contains("uninit()") || s.contains("uninit_array()"))
+    } else {
+        false
+    }
+}
 
-/// Marks a function as an interrupt handler. (Wrapping as a mret function)
+/// Argument for the external_interrupt attribute.
+struct ExternalInterruptArg {
+    interrupt: syn::Path,
+}
+
+impl Parse for ExternalInterruptArg {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        Ok(ExternalInterruptArg {
+            interrupt: input.parse()?,
+        })
+    }
+}
+
+/// Define an external interrupt handler for HPMicro PLIC.
 ///
-/// Note that Rust has also introduced the `riscv-interrupt-m` and `riscv-interrupt-s` ABI, which
-/// are used for machine and supervisor mode interrupts, respectively. These ABIs can also be used for
-/// Qingke cores, yet they add additional register saving and restoring that is not necessary.
+/// This macro generates an interrupt handler function that will be called
+/// when the specified PLIC interrupt occurs. The function is exported with
+/// the interrupt name so it can be placed in the vector table.
 ///
-/// Usage:
+/// # Example
+///
 /// ```ignore
-/// #[interrupt]
-/// fn UART0() { ... }
+/// use hpm_riscv_rt::external_interrupt;
+/// use hpm_pac::interrupt;
 ///
-/// #[interrupt(MachineTimer)]
-/// fn SysTick() { ... }
+/// #[external_interrupt(interrupt::UART0)]
+/// fn uart0_handler() {
+///     // Handle UART0 interrupt
+/// }
 /// ```
+///
+/// # Safety
+///
+/// The handler function runs in interrupt context. It must:
+/// - Not block or wait
+/// - Complete quickly
+/// - Handle the interrupt source to prevent re-triggering
 #[proc_macro_attribute]
-pub fn interrupt(args: TokenStream, input: TokenStream) -> TokenStream {
-    use syn::{AttributeArgs, Meta, NestedMeta};
-
-    let mut f = parse_macro_input!(input as ItemFn);
-
-    let mut link_name = f.sig.ident.to_string();
-    let mut is_core_irq = false;
-
-    if !args.is_empty() {
-        let args: AttributeArgs = parse_macro_input!(args as AttributeArgs);
-        if args.len() > 1 {
-            return parse::Error::new(
-                Span::call_site(),
-                "Accept form: #[interrupt], #[interrupt(InterruptName)], #[interrupt(InterruptName)]",
-            )
-            .to_compile_error()
-            .into();
-        }
-
-        if let NestedMeta::Meta(Meta::Path(ref p)) = args[0] {
-            if let Some(ident) = p.get_ident() {
-                if let Some(irq_name) = CORE_INTERRUPTS.iter().find(|s| ident == *s) {
-                    link_name = irq_name.to_string();
-                    is_core_irq = true;
-                } else {
-                    link_name = ident.to_string();
-                }
-            }
-        } else {
-            return parse::Error::new(
-                Span::call_site(),
-                "Wrong type of argument, expected a core interrupt name",
-            )
-            .to_compile_error()
-            .into();
-        }
-    } else {
-        if CORE_INTERRUPTS.iter().any(|s| link_name == *s) {
-            is_core_irq = true;
-        }
-    }
-
-    // check the function arguments
-    if !f.sig.inputs.is_empty() {
-        return parse::Error::new(
-            f.sig.inputs.last().unwrap().span(),
-            "`#[interrupt]` function accepts no arguments",
-        )
-        .to_compile_error()
-        .into();
-    }
-
-    let valid_signature = f.sig.constness.is_none()
-        && f.vis == Visibility::Inherited
-        && f.sig.abi.is_none()
-        && f.sig.generics.params.is_empty()
-        && f.sig.generics.where_clause.is_none()
-        && f.sig.variadic.is_none()
-        && match f.sig.output {
-            ReturnType::Default => true,
-            ReturnType::Type(_, ref ty) => match **ty {
-                Type::Tuple(ref tuple) => tuple.elems.is_empty(),
-                Type::Never(..) => true,
-                _ => false,
-            },
-        }
-        && f.sig.inputs.len() <= 1;
-
-    if !valid_signature {
-        return parse::Error::new(
-            f.span(),
-            "`#[interrupt]` handlers must have signature `[unsafe] fn() [-> !]`",
-        )
-        .to_compile_error()
-        .into();
-    }
-
-    if !is_core_irq {
-        f.sig.abi = Some(Abi {
-            extern_token: token::Extern(Span::call_site()),
-            name: Some(LitStr::new("riscv-interrupt-m", Span::call_site())),
-        });
-        f.sig.unsafety = Some(token::Unsafe(Span::call_site()))
-    } else {
-        f.sig.abi = Some(Abi {
-            extern_token: token::Extern(Span::call_site()),
-            name: Some(LitStr::new("C", Span::call_site())),
-        });
-    }
-
-    f.sig.ident = Ident::new(&link_name, Span::call_site());
-
-    quote!(
-        #[allow(non_snake_case)]
-        #[link_section = ".isr_vector"]
-        #[no_mangle]
-        #f
-    )
-    .into()
-}
-
-#[proc_macro_attribute]
-pub fn pre_init(args: TokenStream, input: TokenStream) -> TokenStream {
+pub fn external_interrupt(args: TokenStream, input: TokenStream) -> TokenStream {
+    let args = parse_macro_input!(args as ExternalInterruptArg);
     let f = parse_macro_input!(input as ItemFn);
 
-    // check the function signature
-    let valid_signature = f.sig.constness.is_none()
-        && f.vis == Visibility::Inherited
-        && f.sig.unsafety.is_some()
-        && f.sig.abi.is_none()
-        && f.sig.inputs.is_empty()
-        && f.sig.generics.params.is_empty()
-        && f.sig.generics.where_clause.is_none()
-        && f.sig.variadic.is_none()
-        && match f.sig.output {
-            ReturnType::Default => true,
-            ReturnType::Type(_, ref ty) => match **ty {
-                Type::Tuple(ref tuple) => tuple.elems.is_empty(),
-                _ => false,
-            },
-        };
+    let interrupt_path = &args.interrupt;
+    let fn_name = &f.sig.ident;
+    let fn_body = &f.block;
+    let fn_attrs = &f.attrs;
+    let fn_vis = &f.vis;
 
-    if !valid_signature {
-        return parse::Error::new(
-            f.span(),
-            "`#[pre_init]` function must have signature `unsafe fn()`",
-        )
-        .to_compile_error()
-        .into();
-    }
-
-    if !args.is_empty() {
-        return parse::Error::new(Span::call_site(), "This attribute accepts no arguments")
-            .to_compile_error()
-            .into();
-    }
-
-    // XXX should we blacklist other attributes?
-    let attrs = f.attrs;
-    let ident = f.sig.ident;
-    let block = f.block;
+    // Get the interrupt name from the path (last segment)
+    let interrupt_name = interrupt_path
+        .segments
+        .last()
+        .map(|s| &s.ident)
+        .expect("interrupt path should have at least one segment");
 
     quote!(
-        #[export_name = "__pre_init"]
-        #[allow(missing_docs)]  // we make a private fn public, which can trigger this lint
-        #(#attrs)*
-        pub unsafe fn #ident() #block
+        #(#fn_attrs)*
+        #[unsafe(no_mangle)]
+        #fn_vis unsafe extern "riscv-interrupt-m" fn #interrupt_name() {
+            // The original function body wrapped in unsafe
+            #[inline(always)]
+            unsafe fn #fn_name() #fn_body
+
+            #fn_name()
+        }
     )
     .into()
 }

@@ -1,290 +1,243 @@
+//! HPMicro RISC-V Runtime
+//!
+//! This crate provides complete runtime support for HPMicro RISC-V MCUs,
+//! with HPMicro-specific customizations for PLIC vectored interrupt mode.
+//!
+//! ## Usage
+//!
+//! Add this crate as a dependency:
+//!
+//! ```toml
+//! [dependencies]
+//! hpm-riscv-rt = "0.2"
+//! ```
+//!
+//! Configure linker scripts in `.cargo/config.toml`:
+//!
+//! ```toml
+//! rustflags = [
+//!     "-C", "link-arg=-Tmemory.x",   # User-provided memory layout
+//!     "-C", "link-arg=-Tdevice.x",   # From hpm-metapac (__INTERRUPTS)
+//!     "-C", "link-arg=-Tlink.x",     # From hpm-riscv-rt
+//! ]
+//! ```
+//!
+//! Use the provided macros:
+//!
+//! ```ignore
+//! use hpm_riscv_rt::{entry, pre_init, fast};
+//!
+//! #[pre_init]
+//! unsafe fn before_main() {
+//!     // Called before RAM is initialized
+//! }
+//!
+//! #[entry]
+//! fn main() -> ! {
+//!     loop {}
+//! }
+//!
+//! #[fast]
+//! fn critical_function() {
+//!     // Runs from ILM for better performance
+//! }
+//! ```
+
 #![no_std]
-#![feature(abi_riscv_interrupt)]
 
-use core::arch::global_asm;
-
-use andes_riscv::{
-    register::mmisc_ctl,
-    riscv::register::{mcounteren, mie, mstatus, mtvec, stvec::TrapMode},
-};
-
-pub use hpm_riscv_rt_macros::{entry, fast, interrupt, pre_init};
-
+mod asm;
 pub mod trap;
 
-/// Parse cfg attributes inside a global_asm call.
-macro_rules! cfg_global_asm {
-    {@inner, [$($x:tt)*], } => {
-        global_asm!{$($x)*}
-    };
-    (@inner, [$($x:tt)*], #[cfg($meta:meta)] $asm:literal, $($rest:tt)*) => {
-        #[cfg($meta)]
-        cfg_global_asm!{@inner, [$($x)* $asm,], $($rest)*}
-        #[cfg(not($meta))]
-        cfg_global_asm!{@inner, [$($x)*], $($rest)*}
-    };
-    {@inner, [$($x:tt)*], $asm:literal, $($rest:tt)*} => {
-        cfg_global_asm!{@inner, [$($x)* $asm,], $($rest)*}
-    };
-    {$($asms:tt)*} => {
-        cfg_global_asm!{@inner, [], $($asms)*}
-    };
+use andes_riscv::{
+    plic::{Plic, PlicExt},
+    register::mmisc_ctl,
+};
+use riscv::register::{mcounteren, mie, mstatus, mtvec::{self, Mtvec, TrapMode}};
+
+// Re-export macros
+pub use hpm_riscv_rt_macros::{entry, pre_init, fast, external_interrupt};
+
+/// HPMicro PLIC base address (same for all series)
+const PLIC_BASE: usize = 0xE400_0000;
+
+// ============ TrapFrame ============
+
+/// Registers saved during a trap.
+///
+/// This struct contains the caller-saved registers that are preserved
+/// when entering a trap handler.
+#[repr(C)]
+pub struct TrapFrame {
+    /// Return address
+    pub ra: usize,
+    /// Temporary register t0
+    pub t0: usize,
+    /// Temporary register t1
+    pub t1: usize,
+    /// Temporary register t2
+    pub t2: usize,
+    /// Temporary register t3
+    pub t3: usize,
+    /// Temporary register t4
+    pub t4: usize,
+    /// Temporary register t5
+    pub t5: usize,
+    /// Temporary register t6
+    pub t6: usize,
+    /// Argument/return register a0
+    pub a0: usize,
+    /// Argument register a1
+    pub a1: usize,
+    /// Argument register a2
+    pub a2: usize,
+    /// Argument register a3
+    pub a3: usize,
+    /// Argument register a4
+    pub a4: usize,
+    /// Argument register a5
+    pub a5: usize,
+    /// Argument register a6
+    pub a6: usize,
+    /// Argument register a7
+    pub a7: usize,
 }
 
-//    ".attribute arch, \"rv64im\"",
-cfg_global_asm!(
-    // no "c" here, the same as riscv-rt
-    ".attribute arch, \"rv32im\"",
-    ".section .start, \"ax\"
-     .global _start
-_start:
-     .option push
-     .option norelax
-     la gp, __global_pointer$
-     .option pop
-    ",
-    "la t1, __stack_safe
-     addi sp, t1, -16
-     call __pre_init
-    ",
-    // set sp
-    "la t1, __stack_start__
-     addi sp, t1, -16",
-    "call _start_rust",
-    "
-1:
-    j 1b
-    ",
-);
+// ============ Rust Startup Code ============
 
-// weak functions
-cfg_global_asm!(
-    ".weak __pre_init
-__pre_init:
-     ret",
-    #[cfg(not(feature = "single-hart"))]
-    ".weak _mp_hook
-_mp_hook:
-    beqz a0, 2f // if hartid is 0, return true
-1:  wfi // Otherwise, wait for interrupt in a loop
-    j 1b
-2:  li a0, 1
-    ret",
-);
-
+/// Rust startup function called from assembly after RAM is initialized.
+///
+/// This function:
+/// 1. Enables FPU
+/// 2. Enables L1 Cache
+/// 3. Initializes non-cacheable sections
+/// 4. Sets up interrupts (PLIC vectored mode)
+/// 5. Calls `main`
 #[no_mangle]
-unsafe extern "C" fn _setup_interrupts() {
-    use andes_riscv::plic::{Plic, PlicExt};
+pub unsafe extern "C" fn _hpm_start_rust() -> ! {
+    extern "Rust" {
+        fn main() -> !;
+    }
 
     extern "C" {
-        // Symbol defined in hpm-metapac.
-        // The symbol must be in FLASH(XPI) or ILM section.
-        static __VECTORED_INTERRUPTS: [u32; 1];
+        fn _setup_interrupts();
     }
 
-    const PLIC: Plic = unsafe { Plic::from_ptr(0xE4000000 as *mut ()) };
+    // 1. Enable FPU (all HPMicro MCUs have FPU)
+    mstatus::set_fs(mstatus::FS::Initial);
 
-    // clean up plic, it will help while debugging
-    PLIC.set_threshold(0);
-    for i in 0..1024 {
-        PLIC.targetconfig(0)
-            .claim()
-            .modify(|w| w.set_interrupt_id(i));
-    }
-    // clear any bits left in plic enable register
-    for i in 0..4 {
-        PLIC.targetint(0).inten(i).write(|w| w.0 = 0);
-    }
-
-    // enable mcycle
-    mcounteren::set_cy();
-
-    let vector_addr = __VECTORED_INTERRUPTS.as_ptr() as u32;
-    // TrapMode is ignored in mtvec, it's set in CSR_MMISC_CTL
-    mtvec::write(vector_addr as usize, TrapMode::Direct);
-
-    // Enable vectored external PLIC interrupt
-    {
-        PLIC.feature().modify(|w| w.set_vectored(true));
-        // CSR_MMISC_CTL = 0x7D0
-        // asm!("csrsi 0x7D0, 2");
-        mmisc_ctl().modify(|w| w.set_vec_plic(true));
-
-        mstatus::set_mie(); // must enable global interrupt
-        mstatus::set_sie(); // and supervisor interrupt
-        mie::set_mext(); // and PLIC external interrupt
-    }
-}
-
-#[no_mangle]
-unsafe extern "C" fn _start_rust() -> ! {
+    // 2. Enable L1 Cache
     andes_riscv::l1c::ic_enable();
     andes_riscv::l1c::dc_enable();
     andes_riscv::l1c::dc_invalidate_all();
 
-    extern "C" {
-        fn main() -> !;
-    }
+    // 3. Initialize non-cacheable sections
+    init_noncacheable_sections();
 
-    core::arch::asm!(
-        "
-        la      {start}, __vector_ram_start__
-        la      {end}, __vector_ram_end__
-        la      {input}, __vector_load_addr__
-
-        bgeu    {start},{end},2f
-    1:
-        lw      {a},0({input})
-        addi    {input},{input},4
-        sw      {a},0({start})
-        addi    {start},{start},4
-        bltu    {start},{end},1b
-    2:
-        ",
-        start = out(reg) _,
-        end = out(reg) _,
-        input = out(reg) _,
-        a = out(reg) _,
-    );
-
-    core::arch::asm!(
-        "
-        la      {start}, __data_start__
-        la      {end}, __data_end__
-        la      {input}, __data_load_addr__
-
-        bgeu    {start},{end},2f
-    1:
-        lw      {a},0({input})
-        addi    {input},{input},4
-        sw      {a},0({start})
-        addi    {start},{start},4
-        bltu    {start},{end},1b
-    2:
-        ",
-        start = out(reg) _,
-        end = out(reg) _,
-        input = out(reg) _,
-        a = out(reg) _,
-    );
-
-    core::arch::asm!(
-        "
-        la      {start}, __fast_text_start__
-        la      {end}, __fast_text_end__
-        la      {input}, __fast_text_load_addr__
-
-        bgeu    {start},{end},2f
-    1:
-        lw      {a},0({input})
-        addi    {input},{input},4
-        sw      {a},0({start})
-        addi    {start},{start},4
-        bltu    {start},{end},1b
-    2:
-        ",
-        start = out(reg) _,
-        end = out(reg) _,
-        input = out(reg) _,
-        a = out(reg) _,
-    );
-
-    core::arch::asm!(
-        "
-        la      {start}, __fast_data_start__
-        la      {end}, __fast_data_end__
-        la      {input}, __fast_data_load_addr__
-
-        bgeu    {start},{end},2f
-    1:
-        lw      {a},0({input})
-        addi    {input},{input},4
-        sw      {a},0({start})
-        addi    {start},{start},4
-        bltu    {start},{end},1b
-    2:
-        ",
-        start = out(reg) _,
-        end = out(reg) _,
-        input = out(reg) _,
-        a = out(reg) _,
-    );
-
-    core::arch::asm!(
-        "
-        la      {start}, __noncacheable_data_start__
-        la      {end}, __noncacheable_data_end__
-        la      {input}, __noncacheable_data_load_addr__
-
-        bgeu    {start},{end},2f
-    1:
-        lw      {a},0({input})
-        addi    {input},{input},4
-        sw      {a},0({start})
-        addi    {start},{start},4
-        bltu    {start},{end},1b
-    2:
-        ",
-        start = out(reg) _,
-        end = out(reg) _,
-        input = out(reg) _,
-        a = out(reg) _,
-    );
-
-    // zero-out the bss section
-
-    core::arch::asm!(
-        "
-        la      {start}, __bss_start__
-        la      {end}, __bss_end__
-
-        bgeu    {start},{end},2f
-    1:
-        sw      zero,0({start})
-        addi    {start},{start},4
-        bltu    {start},{end},1b
-    2:
-        ",
-        start = out(reg) _,
-        end = out(reg) _,
-    );
-
-    core::arch::asm!(
-        "
-        la      {start}, __fast_bss_start__
-        la      {end}, __fast_bss_end__
-
-        bgeu    {start},{end},2f
-    1:
-        sw      zero,0({start})
-        addi    {start},{start},4
-        bltu    {start},{end},1b
-    2:
-        ",
-        start = out(reg) _,
-        end = out(reg) _,
-    );
-
-    core::arch::asm!(
-        "
-        la      {start}, __noncacheable_bss_start__
-        la      {end}, __noncacheable_bss_end__
-
-        bgeu    {start},{end},2f
-    1:
-        sw      zero,0({start})
-        addi    {start},{start},4
-        bltu    {start},{end},1b
-    2:
-        ",
-        start = out(reg) _,
-        end = out(reg) _,
-    );
-
+    // 4. Setup interrupts (PLIC vectored mode)
     _setup_interrupts();
 
-    // enable FPU
-    mstatus::set_fs(mstatus::FS::Initial);
-
+    // 5. Jump to main
     main()
+}
+
+/// Initialize non-cacheable data and bss sections.
+#[inline(always)]
+unsafe fn init_noncacheable_sections() {
+    extern "C" {
+        static mut __noncacheable_data_start__: u32;
+        static mut __noncacheable_data_end__: u32;
+        static __noncacheable_data_load_addr__: u32;
+        static mut __noncacheable_bss_start__: u32;
+        static mut __noncacheable_bss_end__: u32;
+    }
+
+    // Copy .noncacheable.data
+    let mut src = core::ptr::addr_of!(__noncacheable_data_load_addr__) as *const u32;
+    let mut dst = core::ptr::addr_of_mut!(__noncacheable_data_start__);
+    let end = core::ptr::addr_of!(__noncacheable_data_end__) as *const u32;
+    while (dst as *const u32) < end {
+        dst.write_volatile(src.read_volatile());
+        src = src.add(1);
+        dst = dst.add(1);
+    }
+
+    // Zero .noncacheable.bss
+    let mut dst = core::ptr::addr_of_mut!(__noncacheable_bss_start__);
+    let end = core::ptr::addr_of!(__noncacheable_bss_end__) as *const u32;
+    while (dst as *const u32) < end {
+        dst.write_volatile(0);
+        dst = dst.add(1);
+    }
+}
+
+// ============ Interrupt Setup ============
+
+/// Setup interrupts for HPMicro MCUs.
+///
+/// This function:
+/// 1. Cleans up PLIC state
+/// 2. Enables mcycle counter
+/// 3. Configures mtvec to point to the vector table
+/// 4. Enables PLIC vectored mode via MMISC_CTL
+/// 5. Enables global interrupts
+#[export_name = "_setup_interrupts"]
+pub unsafe fn setup_interrupts() {
+    extern "C" {
+        // Vector table generated by hpm-metapac
+        // Entry 0: CORE_LOCAL (exceptions and core interrupts)
+        // Entry 1+: PLIC external interrupt handlers
+        static __INTERRUPTS: u32;
+    }
+
+    let plic = Plic::from_ptr(PLIC_BASE as *mut ());
+
+    // 1. Clean up PLIC state
+    plic.set_threshold(0);
+    for i in 0..128 {
+        plic.targetconfig(0)
+            .claim()
+            .modify(|w| w.set_interrupt_id(i as u16));
+    }
+    // Clear all interrupt enables
+    for i in 0..4 {
+        plic.targetint(0).inten(i).write(|w| w.0 = 0);
+    }
+
+    // 2. Enable mcycle counter
+    mcounteren::set_cy();
+
+    // 3. Set vector table address
+    let vector_addr = core::ptr::addr_of!(__INTERRUPTS) as usize;
+    // Note: TrapMode is ignored by hardware when MMISC_CTL.VEC_PLIC is set
+    let mtvec_val = Mtvec::new(vector_addr, TrapMode::Direct);
+    mtvec::write(mtvec_val);
+
+    // 4. Enable PLIC vectored mode (Andes-specific)
+    plic.feature().modify(|w| w.set_vectored(true));
+    mmisc_ctl().modify(|w| w.set_vec_plic(true));
+
+    // 5. Enable global interrupts
+    mstatus::set_mie();
+    mstatus::set_sie();
+    mie::set_mext();
+}
+
+// ============ Default Handlers ============
+
+/// Default exception handler - loops forever.
+#[no_mangle]
+#[allow(non_snake_case)]
+pub extern "C" fn DefaultExceptionHandler(_trap_frame: &TrapFrame) -> ! {
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// Default interrupt handler - loops forever.
+#[no_mangle]
+#[allow(non_snake_case)]
+pub extern "C" fn DefaultInterruptHandler() {
+    loop {
+        core::hint::spin_loop();
+    }
 }

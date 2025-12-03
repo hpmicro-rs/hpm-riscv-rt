@@ -60,6 +60,12 @@ PROVIDE(MachineExternal = DefaultHandler);
 PROVIDE(DefaultHandler = DefaultInterruptHandler);
 PROVIDE(ExceptionHandler = DefaultExceptionHandler);
 
+/* ============ riscv-rt Compatibility Symbols ============ */
+/* abort function for riscv-rt */
+PROVIDE(abort = DefaultExceptionHandler);
+/* hal_main alias for main */
+PROVIDE(hal_main = main);
+
 /* ============ Startup Hooks ============ */
 /* Pre-initialization function (called before RAM init, interrupts disabled) */
 PROVIDE(__pre_init = default_pre_init);
@@ -146,21 +152,27 @@ SECTIONS
     {
         _sidata = LOADADDR(.data);
         _sdata = .;
+        __sdata = .;  /* riscv-rt compatibility */
         /* Global pointer for linker relaxations */
         PROVIDE(__global_pointer$ = . + 0x800);
         *(.sdata .sdata.* .sdata2 .sdata2.*);
         *(.data .data.*);
         . = ALIGN(4);
         _edata = .;
+        __edata = .;  /* riscv-rt compatibility */
     } > REGION_DATA AT > REGION_RODATA
+
+    __sidata = LOADADDR(.data);  /* riscv-rt compatibility */
 
     /* Uninitialized data */
     .bss (NOLOAD) : ALIGN(4)
     {
         _sbss = .;
+        __sbss = .;  /* riscv-rt compatibility */
         *(.sbss .sbss.* .bss .bss.*);
         . = ALIGN(4);
         _ebss = .;
+        __ebss = .;  /* riscv-rt compatibility */
     } > REGION_BSS
 
     /* Fast data section - placed in DLM */
@@ -226,11 +238,11 @@ SECTIONS
         KEEP(*(.ahb_sram .ahb_sram.*));
     } > AHB_SRAM
 
-    /* CAN message buffers (optional) */
-    .can (NOLOAD) :
-    {
-        KEEP(*(.can .can.*));
-    } > REGION_CAN
+    /* CAN message buffers (optional)
+     * User should define REGION_CAN in memory.x if using CAN
+     * Example: REGION_ALIAS("REGION_CAN", AHB_SRAM);
+     */
+    /* .can section removed - define in user memory.x if needed */
 
     /* GOT section - should be empty */
     .got (INFO) :

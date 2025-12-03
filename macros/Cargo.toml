@@ -12,14 +12,12 @@ description = "Procedural macros for hpm-riscv-rt"
 
 [lib]
 proc-macro = true
-# avoid nesting too deep
 path = "lib.rs"
 
 [dependencies]
 quote = "1.0"
 proc-macro2 = "1.0"
-proc-macro-error = "1.0.4"
 
 [dependencies.syn]
-version = "1.0"
+version = "2.0"
 features = ["extra-traits", "full"]
