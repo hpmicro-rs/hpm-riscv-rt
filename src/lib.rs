@@ -130,6 +130,10 @@ pub unsafe extern "C" fn _hpm_start_rust() -> ! {
     andes_riscv::l1c::dc_enable();
     andes_riscv::l1c::dc_invalidate_all();
 
+    // 2.5. Configure PMA to make RTT control block non-cacheable (HPM67xx D-cache fix)
+    #[cfg(feature = "hpm67-fix")]
+    configure_rtt_noncacheable();
+
     // 3. Initialize non-cacheable sections
     init_noncacheable_sections();
 
@@ -168,6 +172,54 @@ unsafe fn init_noncacheable_sections() {
         dst.write_volatile(0);
         dst = dst.add(1);
     }
+}
+
+/// Configure PMA to make RTT control block non-cacheable (HPM67xx D-cache fix).
+///
+/// This function detects if defmt-rtt is linked by checking if `_SEGGER_RTT` symbol
+/// exists (linker provides 0 if not defined). If linked, it configures PMA entry 0
+/// to make that region non-cacheable, solving the D-cache coherency issue with probe-rs RTT.
+///
+/// PMA configuration:
+/// - Entry type: NAPOT (Naturally Aligned Power Of Two)
+/// - Memory type: Non-cacheable, Bufferable
+/// - Region size: 4KB (aligned down from _SEGGER_RTT address)
+#[cfg(feature = "hpm67-fix")]
+unsafe fn configure_rtt_noncacheable() {
+    use andes_riscv::register::{pmacfg0, pmaaddr0};
+    use andes_riscv::register::vals::{EntryType, MemoryType};
+
+    // Weak symbol - will be null/zero if defmt-rtt is not linked
+    extern "C" {
+        #[link_name = "_SEGGER_RTT"]
+        static SEGGER_RTT: u8;
+    }
+
+    // Get the address of _SEGGER_RTT
+    let rtt_addr = core::ptr::addr_of!(SEGGER_RTT) as u32;
+
+    // Skip if symbol doesn't exist (address would be 0 or invalid)
+    if rtt_addr == 0 {
+        return;
+    }
+
+    // Align down to 4KB boundary (PMA NAPOT minimum practical granularity)
+    let aligned_addr = rtt_addr & !0xFFF;
+    let size = 0x1000u32; // 4KB
+
+    // NAPOT address format: (base + size/2 - 1) >> 2
+    let napot_addr = (aligned_addr + (size >> 1) - 1) >> 2;
+
+    // Configure PMA entry 0 to make RTT region non-cacheable
+    pmaaddr0().write(|w| *w = napot_addr);
+    pmacfg0().write(|w| {
+        w.set_etyp(0, EntryType::NAPOT);
+        w.set_mtyp(0, MemoryType::MEM_NON_CACHE_BUF);
+        w.set_namo(0, false); // Allow atomic operations
+    });
+
+    // Fence to ensure PMA takes effect
+    core::arch::asm!("fence.i");
 }
 
 // ============ Interrupt Setup ============

@@ -37,7 +37,9 @@ hpm-riscv-rt-macros = { version = "0.3.0", path = "macros" }
 
 [features]
 default = []
-# HPM6700 series errata workaround (ignore illegal instruction exception with mtval=0)
+# HPM6700 series errata workaround:
+# - Ignore illegal instruction exception with mtval=0
+# - Configure PMA to make RTT control block non-cacheable (D-cache fix)
 hpm67-fix = []
 # Dual-core support (disables single-hart optimizations)
 dual-core = []
