@@ -134,6 +134,10 @@ pub unsafe extern "C" fn _hpm_start_rust() -> ! {
     #[cfg(feature = "hpm67-fix")]
     configure_rtt_noncacheable();
 
+    // 2.6. Configure PMA for REGION_NONCACHEABLE_RAM (HPM5E/62/63/67/68)
+    #[cfg(feature = "pma-noncacheable")]
+    configure_noncacheable_pma();
+
     // 3. Initialize non-cacheable sections
     init_noncacheable_sections();
 
@@ -212,10 +216,65 @@ unsafe fn configure_rtt_noncacheable() {
 
     // Configure PMA entry 0 to make RTT region non-cacheable
     pmaaddr0().write(|w| *w = napot_addr);
-    pmacfg0().write(|w| {
+    pmacfg0().modify(|w| {
         w.set_etyp(0, EntryType::NAPOT);
         w.set_mtyp(0, MemoryType::MEM_NON_CACHE_BUF);
         w.set_namo(0, false); // Allow atomic operations
+    });
+
+    // Fence to ensure PMA takes effect
+    core::arch::asm!("fence.i");
+}
+
+/// Configure PMA to make REGION_NONCACHEABLE_RAM actually non-cacheable.
+///
+/// This function reads the linker-provided `__noncacheable_start__` and `__noncacheable_end__`
+/// symbols and configures PMA entry 1 to make that region non-cacheable.
+///
+/// Required for HPM5E/62/63/67/68 series. Not needed for HPM53 (no noncacheable region).
+///
+/// Note: Uses PMA entry 1 (entry 0 may be used by RTT fix on HPM67xx).
+#[cfg(feature = "pma-noncacheable")]
+unsafe fn configure_noncacheable_pma() {
+    use andes_riscv::register::{pmacfg0, pmaaddr1};
+    use andes_riscv::register::vals::{EntryType, MemoryType};
+
+    extern "C" {
+        static __noncacheable_start__: u32;
+        static __noncacheable_end__: u32;
+    }
+
+    let start = core::ptr::addr_of!(__noncacheable_start__) as u32;
+    let end = core::ptr::addr_of!(__noncacheable_end__) as u32;
+
+    // Skip if noncacheable region is empty (e.g., HPM5300)
+    if end <= start {
+        return;
+    }
+
+    let length = end - start;
+
+    // Verify alignment requirements (must be power of 2 aligned)
+    // The linker script should ensure this, but check anyway
+    debug_assert!(
+        (length & (length - 1)) == 0,
+        "noncacheable region length must be power of 2"
+    );
+    debug_assert!(
+        (start & (length - 1)) == 0,
+        "noncacheable region start must be aligned to its size"
+    );
+
+    // NAPOT address format: (base + size/2 - 1) >> 2
+    let napot_addr = (start + (length >> 1) - 1) >> 2;
+
+    // Configure PMA entry 1 to make noncacheable region non-cacheable
+    // Use modify() to preserve entry 0 (RTT) configuration if hpm67-fix is also enabled
+    pmaaddr1().write(|w| *w = napot_addr);
+    pmacfg0().modify(|w| {
+        w.set_etyp(1, EntryType::NAPOT);
+        w.set_mtyp(1, MemoryType::MEM_NON_CACHE_BUF);
+        w.set_namo(1, true); // Allow atomic operations
     });
 
     // Fence to ensure PMA takes effect

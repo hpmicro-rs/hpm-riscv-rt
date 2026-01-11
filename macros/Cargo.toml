@@ -6,9 +6,9 @@ documentation.workspace = true
 homepage.workspace = true
 categories.workspace = true
 license.workspace = true
-version.workspace = true
 edition.workspace = true
 description = "Procedural macros for hpm-riscv-rt"
+version = "0.3.0"
 
 [lib]
 proc-macro = true

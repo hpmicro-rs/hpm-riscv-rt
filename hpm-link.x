@@ -33,6 +33,10 @@ PROVIDE(_stack_start = ORIGIN(REGION_STACK) + LENGTH(REGION_STACK));
 /* RTT support: provide 0 if defmt-rtt is not linked */
 PROVIDE(_SEGGER_RTT = 0);
 
+/* Non-cacheable region: provide 0 if not defined in memory.x */
+PROVIDE(__noncacheable_start__ = 0);
+PROVIDE(__noncacheable_end__ = 0);
+
 /* ============ Exception Handlers ============ */
 /* Default to ExceptionHandler if not defined */
 PROVIDE(InstructionMisaligned = ExceptionHandler);

@@ -8,7 +8,7 @@ documentation = "https://docs.rs/hpm-riscv"
 homepage = "https://github.com/hpmicro-rs/hpm-riscv-rt"
 categories = ["embedded", "no-std", "hardware-support"]
 license = "MIT/Apache-2.0"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 
 [package]
@@ -43,6 +43,9 @@ default = []
 hpm67-fix = []
 # Dual-core support (disables single-hart optimizations)
 dual-core = []
+# Configure PMA to make REGION_NONCACHEABLE_RAM actually non-cacheable
+# Enable for chips with D-cache that have noncacheable regions (HPM5E/62/63/67/68, NOT HPM53)
+pma-noncacheable = []
 
 [package.metadata.docs.rs]
 targets = ["riscv32imafc-unknown-none-elf"]
