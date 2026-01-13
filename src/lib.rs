@@ -130,12 +130,17 @@ pub unsafe extern "C" fn _hpm_start_rust() -> ! {
     andes_riscv::l1c::dc_enable();
     andes_riscv::l1c::dc_invalidate_all();
 
-    // 2.5. Configure PMA to make RTT control block non-cacheable (HPM67xx D-cache fix)
-    #[cfg(feature = "hpm67-fix")]
+    // 2.5. Configure PMA entries for non-cacheable regions
+    // HPM67xx needs both RTT fix and noncacheable region configured together
+    #[cfg(all(feature = "hpm67-fix", feature = "pma-noncacheable"))]
+    configure_pma_hpm67();
+
+    // Only RTT fix (no noncacheable region)
+    #[cfg(all(feature = "hpm67-fix", not(feature = "pma-noncacheable")))]
     configure_rtt_noncacheable();
 
-    // 2.6. Configure PMA for REGION_NONCACHEABLE_RAM (HPM5E/62/63/67/68)
-    #[cfg(feature = "pma-noncacheable")]
+    // Only noncacheable region (non-HPM67 chips)
+    #[cfg(all(feature = "pma-noncacheable", not(feature = "hpm67-fix")))]
     configure_noncacheable_pma();
 
     // 3. Initialize non-cacheable sections
@@ -178,6 +183,65 @@ unsafe fn init_noncacheable_sections() {
     }
 }
 
+/// Configure PMA for HPM67xx: both RTT fix and noncacheable region in one call.
+///
+/// This avoids potential issues with separate pmacfg0 modifications.
+/// - Entry 0: RTT control block (4KB)
+/// - Entry 1: REGION_NONCACHEABLE_RAM
+#[cfg(all(feature = "hpm67-fix", feature = "pma-noncacheable"))]
+unsafe fn configure_pma_hpm67() {
+    use andes_riscv::register::{pmaaddr0, pmaaddr1};
+
+    // RTT symbol (weak, 0 if not linked)
+    extern "C" {
+        #[link_name = "_SEGGER_RTT"]
+        static SEGGER_RTT: u8;
+        static __noncacheable_start__: u32;
+        static __noncacheable_end__: u32;
+    }
+
+    let rtt_addr = core::ptr::addr_of!(SEGGER_RTT) as u32;
+    let nc_start = core::ptr::addr_of!(__noncacheable_start__) as u32;
+    let nc_end = core::ptr::addr_of!(__noncacheable_end__) as u32;
+
+    // PMA entry format (8 bits each):
+    // [1:0] ETYP: 0=OFF, 1=TOR, 2=NA4, 3=NAPOT
+    // [4:2] MTYP: 0=Device, 2=Non-cacheable non-bufferable, 3=Non-cacheable bufferable
+    // [5]   AMO:  Atomic operations
+    // [7:6] Reserved
+    const ENTRY_NAPOT_NC_BUF: u32 = 0x0F; // ETYP=NAPOT(3), MTYP=NC_BUF(3), AMO=0
+    const ENTRY_NAPOT_NC_BUF_AMO: u32 = 0x2F; // ETYP=NAPOT(3), MTYP=NC_BUF(3), AMO=1
+
+    let mut pmacfg0_val: u32 = 0;
+
+    // Entry 0: RTT (4KB)
+    if rtt_addr != 0 {
+        let aligned_addr = rtt_addr & !0xFFF;
+        let size = 0x1000u32; // 4KB
+        let napot_addr = (aligned_addr + (size >> 1) - 1) >> 2;
+        pmaaddr0().write(|w| *w = napot_addr);
+        pmacfg0_val |= ENTRY_NAPOT_NC_BUF; // Entry 0 in bits [7:0]
+    }
+
+    // Entry 1: Noncacheable region
+    if nc_end > nc_start {
+        let length = nc_end - nc_start;
+        let napot_addr = (nc_start + (length >> 1) - 1) >> 2;
+        pmaaddr1().write(|w| *w = napot_addr);
+        pmacfg0_val |= ENTRY_NAPOT_NC_BUF_AMO << 8; // Entry 1 in bits [15:8]
+    }
+
+    // Write pmacfg0 directly using CSR instruction
+    core::arch::asm!(
+        "csrw 0xBC0, {0}",  // pmacfg0 = 0xBC0
+        in(reg) pmacfg0_val,
+        options(nomem, nostack)
+    );
+
+    // Fence to ensure PMA takes effect
+    core::arch::asm!("fence.i");
+}
+
 /// Configure PMA to make RTT control block non-cacheable (HPM67xx D-cache fix).
 ///
 /// This function detects if defmt-rtt is linked by checking if `_SEGGER_RTT` symbol
@@ -188,10 +252,9 @@ unsafe fn init_noncacheable_sections() {
 /// - Entry type: NAPOT (Naturally Aligned Power Of Two)
 /// - Memory type: Non-cacheable, Bufferable
 /// - Region size: 4KB (aligned down from _SEGGER_RTT address)
-#[cfg(feature = "hpm67-fix")]
+#[cfg(all(feature = "hpm67-fix", not(feature = "pma-noncacheable")))]
 unsafe fn configure_rtt_noncacheable() {
-    use andes_riscv::register::{pmacfg0, pmaaddr0};
-    use andes_riscv::register::vals::{EntryType, MemoryType};
+    use andes_riscv::register::pmaaddr0;
 
     // Weak symbol - will be null/zero if defmt-rtt is not linked
     extern "C" {
@@ -215,12 +278,13 @@ unsafe fn configure_rtt_noncacheable() {
     let napot_addr = (aligned_addr + (size >> 1) - 1) >> 2;
 
     // Configure PMA entry 0 to make RTT region non-cacheable
+    // ENTRY_NAPOT_NC_BUF = 0x0F: ETYP=NAPOT(3), MTYP=NC_BUF(3), AMO=0
     pmaaddr0().write(|w| *w = napot_addr);
-    pmacfg0().modify(|w| {
-        w.set_etyp(0, EntryType::NAPOT);
-        w.set_mtyp(0, MemoryType::MEM_NON_CACHE_BUF);
-        w.set_namo(0, false); // Allow atomic operations
-    });
+    core::arch::asm!(
+        "csrw 0xBC0, {0}",  // pmacfg0 = 0xBC0
+        in(reg) 0x0Fu32,
+        options(nomem, nostack)
+    );
 
     // Fence to ensure PMA takes effect
     core::arch::asm!("fence.i");
@@ -231,13 +295,10 @@ unsafe fn configure_rtt_noncacheable() {
 /// This function reads the linker-provided `__noncacheable_start__` and `__noncacheable_end__`
 /// symbols and configures PMA entry 1 to make that region non-cacheable.
 ///
-/// Required for HPM5E/62/63/67/68 series. Not needed for HPM53 (no noncacheable region).
-///
-/// Note: Uses PMA entry 1 (entry 0 may be used by RTT fix on HPM67xx).
-#[cfg(feature = "pma-noncacheable")]
+/// Required for HPM5E/62/63 series. For HPM67xx, use configure_pma_hpm67() instead.
+#[cfg(all(feature = "pma-noncacheable", not(feature = "hpm67-fix")))]
 unsafe fn configure_noncacheable_pma() {
-    use andes_riscv::register::{pmacfg0, pmaaddr1};
-    use andes_riscv::register::vals::{EntryType, MemoryType};
+    use andes_riscv::register::pmaaddr1;
 
     extern "C" {
         static __noncacheable_start__: u32;
@@ -255,7 +316,6 @@ unsafe fn configure_noncacheable_pma() {
     let length = end - start;
 
     // Verify alignment requirements (must be power of 2 aligned)
-    // The linker script should ensure this, but check anyway
     debug_assert!(
         (length & (length - 1)) == 0,
         "noncacheable region length must be power of 2"
@@ -269,13 +329,13 @@ unsafe fn configure_noncacheable_pma() {
     let napot_addr = (start + (length >> 1) - 1) >> 2;
 
     // Configure PMA entry 1 to make noncacheable region non-cacheable
-    // Use modify() to preserve entry 0 (RTT) configuration if hpm67-fix is also enabled
+    // ENTRY_NAPOT_NC_BUF_AMO = 0x2F: ETYP=NAPOT(3), MTYP=NC_BUF(3), AMO=1
     pmaaddr1().write(|w| *w = napot_addr);
-    pmacfg0().modify(|w| {
-        w.set_etyp(1, EntryType::NAPOT);
-        w.set_mtyp(1, MemoryType::MEM_NON_CACHE_BUF);
-        w.set_namo(1, true); // Allow atomic operations
-    });
+    core::arch::asm!(
+        "csrw 0xBC0, {0}",  // pmacfg0 = 0xBC0, Entry 1 in bits [15:8]
+        in(reg) (0x2Fu32 << 8),
+        options(nomem, nostack)
+    );
 
     // Fence to ensure PMA takes effect
     core::arch::asm!("fence.i");
