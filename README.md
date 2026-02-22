@@ -2,6 +2,10 @@
 
 Runtime support for HPMicro RISC-V MCUs with Andes PLIC vectored interrupt mode.
 
+[![Crates.io](https://img.shields.io/crates/v/hpm-riscv-rt.svg)](https://crates.io/crates/hpm-riscv-rt)
+[![Docs.rs](https://docs.rs/hpm-riscv-rt/badge.svg)](https://docs.rs/hpm-riscv-rt)
+[![License](https://img.shields.io/crates/l/hpm-riscv-rt.svg)](LICENSE-MIT)
+
 ## Features
 
 - Complete startup code (`_hpm_start`) with RAM initialization
