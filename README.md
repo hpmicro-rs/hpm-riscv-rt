@@ -21,7 +21,7 @@ Runtime support for HPMicro RISC-V MCUs with Andes PLIC vectored interrupt mode.
 
 ```toml
 [dependencies]
-hpm-riscv-rt = "0.2"
+hpm-riscv-rt = "0.3"
 ```
 
 ### 2. Configure linker scripts
