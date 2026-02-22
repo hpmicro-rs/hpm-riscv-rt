@@ -8,7 +8,7 @@ documentation = "https://docs.rs/hpm-riscv"
 homepage = "https://github.com/hpmicro-rs/hpm-riscv-rt"
 categories = ["embedded", "no-std", "hardware-support"]
 license = "MIT/Apache-2.0"
-version = "0.3.3"
+version = "0.3.4"
 edition = "2021"
 
 [package]
@@ -28,10 +28,10 @@ build = "build.rs"
 
 [dependencies]
 riscv = { version = "0.16.0", features = ["critical-section-single-hart"] }
-andes-riscv = "0.1.4"
+andes-riscv = "0.3.0"
 
 # Macros
-hpm-riscv-rt-macros = { version = "0.3.0", path = "macros" }
+hpm-riscv-rt-macros = { version = "0.3.4", path = "macros" }
 
 [build-dependencies]
 

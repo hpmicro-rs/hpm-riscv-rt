@@ -8,7 +8,7 @@ categories.workspace = true
 license.workspace = true
 edition.workspace = true
 description = "Procedural macros for hpm-riscv-rt"
-version = "0.3.0"
+version = "0.3.4"
 
 [lib]
 proc-macro = true

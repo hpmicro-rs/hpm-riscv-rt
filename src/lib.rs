@@ -50,7 +50,7 @@ pub mod trap;
 
 use andes_riscv::{
     plic::{Plic, PlicExt},
-    register::mmisc_ctl,
+    register,
 };
 use riscv::register::{mcounteren, mie, mstatus, mtvec::{self, Mtvec, TrapMode}};
 
@@ -190,8 +190,6 @@ unsafe fn init_noncacheable_sections() {
 /// - Entry 1: REGION_NONCACHEABLE_RAM
 #[cfg(all(feature = "hpm67-fix", feature = "pma-noncacheable"))]
 unsafe fn configure_pma_hpm67() {
-    use andes_riscv::register::{pmaaddr0, pmaaddr1};
-
     // RTT symbol (weak, 0 if not linked)
     extern "C" {
         #[link_name = "_SEGGER_RTT"]
@@ -219,7 +217,7 @@ unsafe fn configure_pma_hpm67() {
         let aligned_addr = rtt_addr & !0xFFF;
         let size = 0x1000u32; // 4KB
         let napot_addr = (aligned_addr + (size >> 1) - 1) >> 2;
-        pmaaddr0().write(|w| *w = napot_addr);
+        register::pmaaddr0::write(napot_addr as usize);
         pmacfg0_val |= ENTRY_NAPOT_NC_BUF; // Entry 0 in bits [7:0]
     }
 
@@ -227,7 +225,7 @@ unsafe fn configure_pma_hpm67() {
     if nc_end > nc_start {
         let length = nc_end - nc_start;
         let napot_addr = (nc_start + (length >> 1) - 1) >> 2;
-        pmaaddr1().write(|w| *w = napot_addr);
+        register::pmaaddr1::write(napot_addr as usize);
         pmacfg0_val |= ENTRY_NAPOT_NC_BUF_AMO << 8; // Entry 1 in bits [15:8]
     }
 
@@ -254,8 +252,6 @@ unsafe fn configure_pma_hpm67() {
 /// - Region size: 4KB (aligned down from _SEGGER_RTT address)
 #[cfg(all(feature = "hpm67-fix", not(feature = "pma-noncacheable")))]
 unsafe fn configure_rtt_noncacheable() {
-    use andes_riscv::register::pmaaddr0;
-
     // Weak symbol - will be null/zero if defmt-rtt is not linked
     extern "C" {
         #[link_name = "_SEGGER_RTT"]
@@ -279,7 +275,7 @@ unsafe fn configure_rtt_noncacheable() {
 
     // Configure PMA entry 0 to make RTT region non-cacheable
     // ENTRY_NAPOT_NC_BUF = 0x0F: ETYP=NAPOT(3), MTYP=NC_BUF(3), AMO=0
-    pmaaddr0().write(|w| *w = napot_addr);
+    register::pmaaddr0::write(napot_addr as usize);
     core::arch::asm!(
         "csrw 0xBC0, {0}",  // pmacfg0 = 0xBC0
         in(reg) 0x0Fu32,
@@ -298,8 +294,6 @@ unsafe fn configure_rtt_noncacheable() {
 /// Required for HPM5E/62/63 series. For HPM67xx, use configure_pma_hpm67() instead.
 #[cfg(all(feature = "pma-noncacheable", not(feature = "hpm67-fix")))]
 unsafe fn configure_noncacheable_pma() {
-    use andes_riscv::register::pmaaddr1;
-
     extern "C" {
         static __noncacheable_start__: u32;
         static __noncacheable_end__: u32;
@@ -330,7 +324,7 @@ unsafe fn configure_noncacheable_pma() {
 
     // Configure PMA entry 1 to make noncacheable region non-cacheable
     // ENTRY_NAPOT_NC_BUF_AMO = 0x2F: ETYP=NAPOT(3), MTYP=NC_BUF(3), AMO=1
-    pmaaddr1().write(|w| *w = napot_addr);
+    register::pmaaddr1::write(napot_addr as usize);
     core::arch::asm!(
         "csrw 0xBC0, {0}",  // pmacfg0 = 0xBC0, Entry 1 in bits [15:8]
         in(reg) (0x2Fu32 << 8),
@@ -385,7 +379,7 @@ pub unsafe fn setup_interrupts() {
 
     // 4. Enable PLIC vectored mode (Andes-specific)
     plic.feature().modify(|w| w.set_vectored(true));
-    mmisc_ctl().modify(|w| w.set_vec_plic(true));
+    register::mmisc_ctl::set_vec_plic();
 
     // 5. Enable global interrupts
     mstatus::set_mie();
