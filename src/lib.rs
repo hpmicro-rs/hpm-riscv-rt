@@ -52,20 +52,25 @@ use andes_riscv::{
     plic::{Plic, PlicExt},
     register,
 };
-use riscv::register::{mcounteren, mie, mstatus, mtvec::{self, Mtvec, TrapMode}};
+use riscv::register::{
+    mcounteren, mie, mstatus,
+    mtvec::{self, Mtvec, TrapMode},
+};
 
 // Re-export macros
-pub use hpm_riscv_rt_macros::{entry, pre_init, fast, external_interrupt};
+pub use hpm_riscv_rt_macros::{entry, external_interrupt, fast, pre_init};
 
 /// HPMicro PLIC base address (same for all series)
 const PLIC_BASE: usize = 0xE400_0000;
+
+const PMP_RWX_NAPOT: u32 = 0x1F;
+const PMA_NAPOT_MEM_NC_BUF: u32 = 0x0F;
 
 // ============ TrapFrame ============
 
 /// Registers saved during a trap.
 ///
-/// This struct contains the caller-saved registers that are preserved
-/// when entering a trap handler.
+/// This struct mirrors the integer context saved by the CORE_LOCAL trap entry.
 #[repr(C)]
 pub struct TrapFrame {
     /// Return address
@@ -100,6 +105,34 @@ pub struct TrapFrame {
     pub a6: usize,
     /// Argument register a7
     pub a7: usize,
+    /// Global pointer
+    pub gp: usize,
+    /// Thread pointer
+    pub tp: usize,
+    /// Saved register s0/frame pointer
+    pub s0: usize,
+    /// Saved register s1
+    pub s1: usize,
+    /// Saved register s2
+    pub s2: usize,
+    /// Saved register s3
+    pub s3: usize,
+    /// Saved register s4
+    pub s4: usize,
+    /// Saved register s5
+    pub s5: usize,
+    /// Saved register s6
+    pub s6: usize,
+    /// Saved register s7
+    pub s7: usize,
+    /// Saved register s8
+    pub s8: usize,
+    /// Saved register s9
+    pub s9: usize,
+    /// Saved register s10
+    pub s10: usize,
+    /// Saved register s11
+    pub s11: usize,
 }
 
 // ============ Rust Startup Code ============
@@ -202,39 +235,34 @@ unsafe fn configure_pma_hpm67() {
     let nc_start = core::ptr::addr_of!(__noncacheable_start__) as u32;
     let nc_end = core::ptr::addr_of!(__noncacheable_end__) as u32;
 
-    // PMA entry format (8 bits each):
-    // [1:0] ETYP: 0=OFF, 1=TOR, 2=NA4, 3=NAPOT
-    // [4:2] MTYP: 0=Device, 2=Non-cacheable non-bufferable, 3=Non-cacheable bufferable
-    // [5]   AMO:  Atomic operations
-    // [7:6] Reserved
-    const ENTRY_NAPOT_NC_BUF: u32 = 0x0F; // ETYP=NAPOT(3), MTYP=NC_BUF(3), AMO=0
-    const ENTRY_NAPOT_NC_BUF_AMO: u32 = 0x2F; // ETYP=NAPOT(3), MTYP=NC_BUF(3), AMO=1
-
     let mut pmacfg0_val: u32 = 0;
+    let mut pmpcfg0_val: u32 = PMP_RWX_NAPOT;
 
-    // Entry 0: RTT (4KB)
+    set_pmp_addr0(0xFFFF_FFFF);
+
+    // Entry 1: RTT (4KB)
     if rtt_addr != 0 {
         let aligned_addr = rtt_addr & !0xFFF;
         let size = 0x1000u32; // 4KB
         let napot_addr = (aligned_addr + (size >> 1) - 1) >> 2;
-        register::pmaaddr0::write(napot_addr as usize);
-        pmacfg0_val |= ENTRY_NAPOT_NC_BUF; // Entry 0 in bits [7:0]
+        set_pmp_addr1(napot_addr);
+        register::pmaaddr1::write(napot_addr as usize);
+        pmpcfg0_val |= PMP_RWX_NAPOT << 8;
+        pmacfg0_val |= PMA_NAPOT_MEM_NC_BUF << 8;
     }
 
-    // Entry 1: Noncacheable region
+    // Entry 2: Noncacheable region
     if nc_end > nc_start {
         let length = nc_end - nc_start;
         let napot_addr = (nc_start + (length >> 1) - 1) >> 2;
-        register::pmaaddr1::write(napot_addr as usize);
-        pmacfg0_val |= ENTRY_NAPOT_NC_BUF_AMO << 8; // Entry 1 in bits [15:8]
+        set_pmp_addr2(napot_addr);
+        register::pmaaddr2::write(napot_addr as usize);
+        pmpcfg0_val |= PMP_RWX_NAPOT << 16;
+        pmacfg0_val |= PMA_NAPOT_MEM_NC_BUF << 16;
     }
 
-    // Write pmacfg0 directly using CSR instruction
-    core::arch::asm!(
-        "csrw 0xBC0, {0}",  // pmacfg0 = 0xBC0
-        in(reg) pmacfg0_val,
-        options(nomem, nostack)
-    );
+    write_pmpcfg0(pmpcfg0_val);
+    write_pmacfg0(pmacfg0_val);
 
     // Fence to ensure PMA takes effect
     core::arch::asm!("fence.i");
@@ -273,14 +301,12 @@ unsafe fn configure_rtt_noncacheable() {
     // NAPOT address format: (base + size/2 - 1) >> 2
     let napot_addr = (aligned_addr + (size >> 1) - 1) >> 2;
 
-    // Configure PMA entry 0 to make RTT region non-cacheable
-    // ENTRY_NAPOT_NC_BUF = 0x0F: ETYP=NAPOT(3), MTYP=NC_BUF(3), AMO=0
-    register::pmaaddr0::write(napot_addr as usize);
-    core::arch::asm!(
-        "csrw 0xBC0, {0}",  // pmacfg0 = 0xBC0
-        in(reg) 0x0Fu32,
-        options(nomem, nostack)
-    );
+    // Configure PMA entry 1 to make RTT region non-cacheable.
+    set_pmp_addr0(0xFFFF_FFFF);
+    set_pmp_addr1(napot_addr);
+    register::pmaaddr1::write(napot_addr as usize);
+    write_pmpcfg0(PMP_RWX_NAPOT | (PMP_RWX_NAPOT << 8));
+    write_pmacfg0(PMA_NAPOT_MEM_NC_BUF << 8);
 
     // Fence to ensure PMA takes effect
     core::arch::asm!("fence.i");
@@ -322,17 +348,43 @@ unsafe fn configure_noncacheable_pma() {
     // NAPOT address format: (base + size/2 - 1) >> 2
     let napot_addr = (start + (length >> 1) - 1) >> 2;
 
-    // Configure PMA entry 1 to make noncacheable region non-cacheable
-    // ENTRY_NAPOT_NC_BUF_AMO = 0x2F: ETYP=NAPOT(3), MTYP=NC_BUF(3), AMO=1
+    // Match the HPM SDK board_init_pmp() layout:
+    // Entry 0 grants RWX over the full physical address space.
+    // Entry 1 makes REGION_NONCACHEABLE_RAM uncached for DMA descriptors/buffers.
+    set_pmp_addr0(0xFFFF_FFFF);
+    set_pmp_addr1(napot_addr);
     register::pmaaddr1::write(napot_addr as usize);
-    core::arch::asm!(
-        "csrw 0xBC0, {0}",  // pmacfg0 = 0xBC0, Entry 1 in bits [15:8]
-        in(reg) (0x2Fu32 << 8),
-        options(nomem, nostack)
-    );
+    write_pmpcfg0(PMP_RWX_NAPOT | (PMP_RWX_NAPOT << 8));
+    write_pmacfg0(PMA_NAPOT_MEM_NC_BUF << 8);
 
     // Fence to ensure PMA takes effect
     core::arch::asm!("fence.i");
+}
+
+#[inline(always)]
+unsafe fn set_pmp_addr0(value: u32) {
+    core::arch::asm!("csrw pmpaddr0, {0}", in(reg) value, options(nomem, nostack));
+}
+
+#[inline(always)]
+unsafe fn set_pmp_addr1(value: u32) {
+    core::arch::asm!("csrw pmpaddr1, {0}", in(reg) value, options(nomem, nostack));
+}
+
+#[inline(always)]
+#[cfg(all(feature = "hpm67-fix", feature = "pma-noncacheable"))]
+unsafe fn set_pmp_addr2(value: u32) {
+    core::arch::asm!("csrw pmpaddr2, {0}", in(reg) value, options(nomem, nostack));
+}
+
+#[inline(always)]
+unsafe fn write_pmpcfg0(value: u32) {
+    core::arch::asm!("csrw pmpcfg0, {0}", in(reg) value, options(nomem, nostack));
+}
+
+#[inline(always)]
+unsafe fn write_pmacfg0(value: u32) {
+    core::arch::asm!("csrw 0xBC0, {0}", in(reg) value, options(nomem, nostack));
 }
 
 // ============ Interrupt Setup ============

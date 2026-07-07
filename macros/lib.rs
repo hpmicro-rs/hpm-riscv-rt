@@ -8,7 +8,9 @@
 
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{parse_macro_input, spanned::Spanned, Expr, Item, ItemFn, parse::Parse, parse::ParseStream};
+use syn::{
+    parse::Parse, parse::ParseStream, parse_macro_input, spanned::Spanned, Expr, Item, ItemFn,
+};
 
 /// Attribute to declare the entry point of the program.
 ///
@@ -95,14 +97,12 @@ pub fn fast(_args: TokenStream, input: TokenStream) -> TokenStream {
     let item = parse_macro_input!(input as Item);
 
     match item {
-        Item::Fn(f) => {
-            quote!(
-                #[unsafe(link_section = ".fast.text")]
-                #[inline(never)]
-                #f
-            )
-            .into()
-        }
+        Item::Fn(f) => quote!(
+            #[unsafe(link_section = ".fast.text")]
+            #[inline(never)]
+            #f
+        )
+        .into(),
         Item::Static(item) => {
             // Check if it's uninitialized (MaybeUninit::uninit())
             let section = if is_uninit_expr(&item.expr) {
