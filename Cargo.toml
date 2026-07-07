@@ -40,7 +40,9 @@ default = []
 # HPM6700 series errata workaround:
 # - Ignore illegal instruction exception with mtval=0
 # - Configure PMA to make RTT control block non-cacheable (D-cache fix)
-hpm67-fix = []
+hpm67-fix = ["ignore-illegal-mtval-zero"]
+# Ignore spurious illegal instruction exceptions with mtval=0 on Andes cores.
+ignore-illegal-mtval-zero = []
 # Dual-core support (disables single-hart optimizations)
 dual-core = []
 # Configure PMA to make REGION_NONCACHEABLE_RAM actually non-cacheable

@@ -33,9 +33,9 @@ PROVIDE(_stack_start = ORIGIN(REGION_STACK) + LENGTH(REGION_STACK));
 /* RTT support: provide 0 if defmt-rtt is not linked */
 PROVIDE(_SEGGER_RTT = 0);
 
-/* Non-cacheable region: provide 0 if not defined in memory.x */
-PROVIDE(__noncacheable_start__ = 0);
-PROVIDE(__noncacheable_end__ = 0);
+/* Non-cacheable region used for DMA-visible descriptors and buffers. */
+PROVIDE(__noncacheable_start__ = ORIGIN(REGION_NONCACHEABLE_RAM));
+PROVIDE(__noncacheable_end__ = ORIGIN(REGION_NONCACHEABLE_RAM) + LENGTH(REGION_NONCACHEABLE_RAM));
 
 /* ============ Exception Handlers ============ */
 /* Default to ExceptionHandler if not defined */

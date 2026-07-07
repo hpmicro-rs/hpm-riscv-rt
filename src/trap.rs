@@ -103,8 +103,8 @@ unsafe extern "C" fn _start_rust_CORE_LOCAL(trap_frame: *const TrapFrame) {
     // defmt::trace!("CORE_LOCAL: is_exception={}, code={}", cause.is_exception(), code);
 
     if cause.is_exception() {
-        // HPM6700 Errata: ignore illegal instruction exception with mtval=0
-        #[cfg(feature = "hpm67-fix")]
+        // Some Andes cores can report a legal instruction as illegal with mtval=0.
+        #[cfg(feature = "ignore-illegal-mtval-zero")]
         if code == 2 && riscv::register::mtval::read() == 0 {
             return;
         }
@@ -123,7 +123,7 @@ unsafe extern "C" fn _start_rust_CORE_LOCAL(trap_frame: *const TrapFrame) {
 }
 
 // CORE_LOCAL assembly handler.
-// Saves caller-saved registers, calls Rust handler, restores registers.
+// Saves the interrupted integer context, calls Rust handler, restores registers.
 global_asm!(
     r#"
     .section .trap.rust, "ax"
@@ -132,8 +132,8 @@ global_asm!(
     .balign 4
 
 CORE_LOCAL:
-    /* Save caller-saved registers */
-    addi sp, sp, -(16 * 4)
+    /* Save integer registers. Keep the stack 16-byte aligned for the Rust call. */
+    addi sp, sp, -128
     sw ra, 0(sp)
     sw t0, 4(sp)
     sw t1, 8(sp)
@@ -150,12 +150,26 @@ CORE_LOCAL:
     sw a5, 52(sp)
     sw a6, 56(sp)
     sw a7, 60(sp)
+    sw gp, 64(sp)
+    sw tp, 68(sp)
+    sw s0, 72(sp)
+    sw s1, 76(sp)
+    sw s2, 80(sp)
+    sw s3, 84(sp)
+    sw s4, 88(sp)
+    sw s5, 92(sp)
+    sw s6, 96(sp)
+    sw s7, 100(sp)
+    sw s8, 104(sp)
+    sw s9, 108(sp)
+    sw s10, 112(sp)
+    sw s11, 116(sp)
 
     /* Call Rust handler with trap frame pointer */
     mv a0, sp
     call _start_rust_CORE_LOCAL
 
-    /* Restore caller-saved registers */
+    /* Restore integer registers */
     lw ra, 0(sp)
     lw t0, 4(sp)
     lw t1, 8(sp)
@@ -172,7 +186,21 @@ CORE_LOCAL:
     lw a5, 52(sp)
     lw a6, 56(sp)
     lw a7, 60(sp)
-    addi sp, sp, 16 * 4
+    lw gp, 64(sp)
+    lw tp, 68(sp)
+    lw s0, 72(sp)
+    lw s1, 76(sp)
+    lw s2, 80(sp)
+    lw s3, 84(sp)
+    lw s4, 88(sp)
+    lw s5, 92(sp)
+    lw s6, 96(sp)
+    lw s7, 100(sp)
+    lw s8, 104(sp)
+    lw s9, 108(sp)
+    lw s10, 112(sp)
+    lw s11, 116(sp)
+    addi sp, sp, 128
 
     mret
 

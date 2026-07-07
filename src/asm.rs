@@ -182,4 +182,3 @@ default_start_trap:
     .size default_start_trap, . - default_start_trap
 "#
 );
-
