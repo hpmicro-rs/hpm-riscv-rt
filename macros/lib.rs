@@ -189,16 +189,52 @@ pub fn external_interrupt(args: TokenStream, input: TokenStream) -> TokenStream 
         .last()
         .map(|s| &s.ident)
         .expect("interrupt path should have at least one segment");
-
     quote!(
         #(#fn_attrs)*
         #[unsafe(no_mangle)]
+        #[unsafe(link_section = ".fast.text")]
         #fn_vis unsafe extern "riscv-interrupt-m" fn #interrupt_name() {
             // The original function body wrapped in unsafe
             #[inline(always)]
             unsafe fn #fn_name() #fn_body
 
-            #fn_name()
+            let mepc: usize;
+            let mstatus: usize;
+            let mxstatus: usize;
+            let mcctlbeginaddr: usize;
+            let mcctldata: usize;
+            core::arch::asm!(
+                "csrr {mepc}, mepc",
+                "csrr {mstatus}, mstatus",
+                "csrr {mxstatus}, 0x7c4",
+                "csrr {mcctlbeginaddr}, 0x7cb",
+                "csrr {mcctldata}, 0x7cd",
+                mepc = out(reg) mepc,
+                mstatus = out(reg) mstatus,
+                mxstatus = out(reg) mxstatus,
+                mcctlbeginaddr = out(reg) mcctlbeginaddr,
+                mcctldata = out(reg) mcctldata,
+                options(nomem, nostack),
+            );
+
+            #fn_name();
+
+            // Match the HPM SDK external-IRQ epilogue. HPM cache-control and
+            // prefetch state is CSR-backed and must survive interrupt work.
+            core::arch::asm!(
+                "csrw mstatus, {mstatus}",
+                "csrw mepc, {mepc}",
+                "csrw 0x7c4, {mxstatus}",
+                "csrw 0x7cd, {mcctldata}",
+                "csrw 0x7cb, {mcctlbeginaddr}",
+                "fence io, io",
+                mstatus = in(reg) mstatus,
+                mepc = in(reg) mepc,
+                mxstatus = in(reg) mxstatus,
+                mcctldata = in(reg) mcctldata,
+                mcctlbeginaddr = in(reg) mcctlbeginaddr,
+                options(nostack),
+            );
         }
     )
     .into()

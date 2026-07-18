@@ -22,6 +22,10 @@ ENTRY(_hpm_start);
 PROVIDE(_stack_size = 0x4000);
 PROVIDE(_heap_size = 0);
 
+/* RTT support: provide 0 if defmt-rtt is not linked */
+EXTERN(_SEGGER_RTT);
+PROVIDE(_SEGGER_RTT = 0);
+
 /* Multi-hart configuration (single-hart by default) */
 PROVIDE(_max_hart_id = 0);
 PROVIDE(_hart_stack_size = 2K);
@@ -153,6 +157,13 @@ SECTIONS
         . = ALIGN(4);
         _edata = .;
     } > REGION_DATA AT > REGION_RODATA
+
+    /* Retained diagnostic state, excluded from startup BSS clearing. */
+    .uninit (NOLOAD) : ALIGN(4)
+    {
+        KEEP(*(.uninit .uninit.*));
+        . = ALIGN(4);
+    } > REGION_BSS
 
     /* Uninitialized data */
     .bss (NOLOAD) : ALIGN(4)

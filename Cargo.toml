@@ -48,6 +48,9 @@ dual-core = []
 # Configure PMA to make REGION_NONCACHEABLE_RAM actually non-cacheable
 # Enable for chips with D-cache that have noncacheable regions (HPM5E/62/63/67/68, NOT HPM53)
 pma-noncacheable = []
+# Record traps that occur before an application installs its own handlers.
+# Intended for board bring-up and hardware qualification images.
+diagnostics = []
 
 [package.metadata.docs.rs]
 targets = ["riscv32imafc-unknown-none-elf"]
