@@ -31,6 +31,7 @@ PROVIDE(_stext = ORIGIN(REGION_TEXT));
 PROVIDE(_stack_start = ORIGIN(REGION_STACK) + LENGTH(REGION_STACK));
 
 /* RTT support: provide 0 if defmt-rtt is not linked */
+EXTERN(_SEGGER_RTT);
 PROVIDE(_SEGGER_RTT = 0);
 
 /* Non-cacheable region used for DMA-visible descriptors and buffers. */
@@ -170,6 +171,13 @@ SECTIONS
     } > REGION_DATA AT > REGION_RODATA
 
     __sidata = LOADADDR(.data);  /* riscv-rt compatibility */
+
+    /* Retained diagnostic state, excluded from startup BSS clearing. */
+    .uninit (NOLOAD) : ALIGN(4)
+    {
+        KEEP(*(.uninit .uninit.*));
+        . = ALIGN(4);
+    } > REGION_BSS
 
     /* Uninitialized data */
     .bss (NOLOAD) : ALIGN(4)

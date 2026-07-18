@@ -62,8 +62,12 @@ pub use hpm_riscv_rt_macros::{entry, external_interrupt, fast, pre_init};
 
 /// HPMicro PLIC base address (same for all series)
 const PLIC_BASE: usize = 0xE400_0000;
+#[cfg(feature = "diagnostics")]
+const PLIC_CLAIM_OFFSET: usize = 0x0020_0004;
 
+#[cfg(any(feature = "hpm67-fix", feature = "pma-noncacheable"))]
 const PMP_RWX_NAPOT: u32 = 0x1F;
+#[cfg(any(feature = "hpm67-fix", feature = "pma-noncacheable"))]
 const PMA_NAPOT_MEM_NC_BUF: u32 = 0x0F;
 
 // ============ TrapFrame ============
@@ -145,6 +149,11 @@ pub struct TrapFrame {
 /// 3. Initializes non-cacheable sections
 /// 4. Sets up interrupts (PLIC vectored mode)
 /// 5. Calls `main`
+///
+/// # Safety
+///
+/// This function must run exactly once from the reset entry after the linker
+/// symbols and machine-mode execution environment have been established.
 #[no_mangle]
 pub unsafe extern "C" fn _hpm_start_rust() -> ! {
     extern "Rust" {
@@ -155,11 +164,18 @@ pub unsafe extern "C" fn _hpm_start_rust() -> ! {
         fn _setup_interrupts();
     }
 
+    #[cfg(feature = "diagnostics")]
+    clear_trap_record();
+
     // 1. Enable FPU (all HPMicro MCUs have FPU)
     mstatus::set_fs(mstatus::FS::Initial);
 
     // 2. Enable L1 Cache
     andes_riscv::l1c::ic_enable();
+    // A flash algorithm can leave stale XPI-backed instruction-cache state.
+    // HPM's fence.i operation invalidates the full L1I before execution
+    // continues from the freshly programmed image.
+    core::arch::asm!("fence.i", options(nostack));
     andes_riscv::l1c::dc_enable();
     andes_riscv::l1c::dc_invalidate_all();
 
@@ -175,7 +191,6 @@ pub unsafe extern "C" fn _hpm_start_rust() -> ! {
     // Only noncacheable region (non-HPM67 chips)
     #[cfg(all(feature = "pma-noncacheable", not(feature = "hpm67-fix")))]
     configure_noncacheable_pma();
-
     // 3. Initialize non-cacheable sections
     init_noncacheable_sections();
 
@@ -184,6 +199,18 @@ pub unsafe extern "C" fn _hpm_start_rust() -> ! {
 
     // 5. Jump to main
     main()
+}
+
+#[cfg(feature = "diagnostics")]
+unsafe fn clear_trap_record() {
+    extern "C" {
+        static mut __hpm_preinit_trap_record: u32;
+    }
+
+    let base = core::ptr::addr_of_mut!(__hpm_preinit_trap_record);
+    for offset in 0..8 {
+        base.add(offset).write_volatile(0);
+    }
 }
 
 /// Initialize non-cacheable data and bss sections.
@@ -198,9 +225,9 @@ unsafe fn init_noncacheable_sections() {
     }
 
     // Copy .noncacheable.data
-    let mut src = core::ptr::addr_of!(__noncacheable_data_load_addr__) as *const u32;
+    let mut src = core::ptr::addr_of!(__noncacheable_data_load_addr__);
     let mut dst = core::ptr::addr_of_mut!(__noncacheable_data_start__);
-    let end = core::ptr::addr_of!(__noncacheable_data_end__) as *const u32;
+    let end = core::ptr::addr_of!(__noncacheable_data_end__);
     while (dst as *const u32) < end {
         dst.write_volatile(src.read_volatile());
         src = src.add(1);
@@ -209,7 +236,7 @@ unsafe fn init_noncacheable_sections() {
 
     // Zero .noncacheable.bss
     let mut dst = core::ptr::addr_of_mut!(__noncacheable_bss_start__);
-    let end = core::ptr::addr_of!(__noncacheable_bss_end__) as *const u32;
+    let end = core::ptr::addr_of!(__noncacheable_bss_end__);
     while (dst as *const u32) < end {
         dst.write_volatile(0);
         dst = dst.add(1);
@@ -362,11 +389,13 @@ unsafe fn configure_noncacheable_pma() {
 }
 
 #[inline(always)]
+#[cfg(any(feature = "hpm67-fix", feature = "pma-noncacheable"))]
 unsafe fn set_pmp_addr0(value: u32) {
     core::arch::asm!("csrw pmpaddr0, {0}", in(reg) value, options(nomem, nostack));
 }
 
 #[inline(always)]
+#[cfg(any(feature = "hpm67-fix", feature = "pma-noncacheable"))]
 unsafe fn set_pmp_addr1(value: u32) {
     core::arch::asm!("csrw pmpaddr1, {0}", in(reg) value, options(nomem, nostack));
 }
@@ -378,11 +407,13 @@ unsafe fn set_pmp_addr2(value: u32) {
 }
 
 #[inline(always)]
+#[cfg(any(feature = "hpm67-fix", feature = "pma-noncacheable"))]
 unsafe fn write_pmpcfg0(value: u32) {
     core::arch::asm!("csrw pmpcfg0, {0}", in(reg) value, options(nomem, nostack));
 }
 
 #[inline(always)]
+#[cfg(any(feature = "hpm67-fix", feature = "pma-noncacheable"))]
 unsafe fn write_pmacfg0(value: u32) {
     core::arch::asm!("csrw 0xBC0, {0}", in(reg) value, options(nomem, nostack));
 }
@@ -397,6 +428,11 @@ unsafe fn write_pmacfg0(value: u32) {
 /// 3. Configures mtvec to point to the vector table
 /// 4. Enables PLIC vectored mode via MMISC_CTL
 /// 5. Enables global interrupts
+///
+/// # Safety
+///
+/// The caller must have exclusive access to the machine interrupt CSRs and
+/// PLIC target context while this function resets and configures them.
 #[export_name = "_setup_interrupts"]
 pub unsafe fn setup_interrupts() {
     extern "C" {
@@ -408,12 +444,13 @@ pub unsafe fn setup_interrupts() {
 
     let plic = Plic::from_ptr(PLIC_BASE as *mut ());
 
-    // 1. Clean up PLIC state
+    // 1. Clean up PLIC state. CLAIM/COMPLETE is side-effectful, so each
+    // completion uses a direct write and never a read-modify-write.
     plic.set_threshold(0);
     for i in 0..128 {
         plic.targetconfig(0)
             .claim()
-            .modify(|w| w.set_interrupt_id(i as u16));
+            .write(|w| w.set_interrupt_id(i as u16));
     }
     // Clear all interrupt enables
     for i in 0..4 {
@@ -423,11 +460,10 @@ pub unsafe fn setup_interrupts() {
     // 2. Enable mcycle counter
     mcounteren::set_cy();
 
-    // 3. Set vector table address
+    // 3. Set vector table address. TrapMode is ignored when
+    // MMISC_CTL.VEC_PLIC is enabled.
     let vector_addr = core::ptr::addr_of!(__INTERRUPTS) as usize;
-    // Note: TrapMode is ignored by hardware when MMISC_CTL.VEC_PLIC is set
-    let mtvec_val = Mtvec::new(vector_addr, TrapMode::Direct);
-    mtvec::write(mtvec_val);
+    mtvec::write(Mtvec::new(vector_addr, TrapMode::Direct));
 
     // 4. Enable PLIC vectored mode (Andes-specific)
     plic.feature().modify(|w| w.set_vectored(true));
@@ -444,7 +480,15 @@ pub unsafe fn setup_interrupts() {
 /// Default exception handler - loops forever.
 #[no_mangle]
 #[allow(non_snake_case)]
-pub extern "C" fn DefaultExceptionHandler(_trap_frame: &TrapFrame) -> ! {
+pub extern "C" fn DefaultExceptionHandler(trap_frame: &TrapFrame) -> ! {
+    #[cfg(feature = "diagnostics")]
+    unsafe {
+        record_default_exception(trap_frame as *const TrapFrame as usize);
+    }
+
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = trap_frame;
+
     loop {
         core::hint::spin_loop();
     }
@@ -454,7 +498,80 @@ pub extern "C" fn DefaultExceptionHandler(_trap_frame: &TrapFrame) -> ! {
 #[no_mangle]
 #[allow(non_snake_case)]
 pub extern "C" fn DefaultInterruptHandler() {
+    #[cfg(feature = "diagnostics")]
+    unsafe {
+        record_default_interrupt();
+    }
+
     loop {
         core::hint::spin_loop();
     }
+}
+
+#[inline(always)]
+#[cfg(feature = "diagnostics")]
+unsafe fn record_default_interrupt() {
+    extern "C" {
+        static mut __hpm_preinit_trap_record: u32;
+    }
+
+    let base = core::ptr::addr_of_mut!(__hpm_preinit_trap_record);
+    let claim_addr = (PLIC_BASE + PLIC_CLAIM_OFFSET) as *const u32;
+    core::arch::asm!(
+        "lw t0, 0({claim_addr})",
+        "csrr t1, mtvec",
+        "csrr t2, mstatus",
+        "csrr t3, mie",
+        "csrr t4, mip",
+        "sw {magic}, 0({base})",
+        "sw t0, 4({base})",
+        "sw t1, 8({base})",
+        "sw t2, 12({base})",
+        "sw t3, 16({base})",
+        "sw t4, 20({base})",
+        "sw sp, 24({base})",
+        base = in(reg) base,
+        claim_addr = in(reg) claim_addr,
+        magic = in(reg) 0x4850_4d49u32,
+        out("t0") _,
+        out("t1") _,
+        out("t2") _,
+        out("t3") _,
+        out("t4") _,
+        options(nostack),
+    );
+}
+
+#[inline(always)]
+#[cfg(feature = "diagnostics")]
+unsafe fn record_default_exception(trap_frame: usize) {
+    extern "C" {
+        static mut __hpm_preinit_trap_record: u32;
+    }
+
+    let base = core::ptr::addr_of_mut!(__hpm_preinit_trap_record);
+    core::arch::asm!(
+        "csrr t0, mcause",
+        "csrr t1, mepc",
+        "csrr t2, mtval",
+        "csrr t3, mtvec",
+        "csrr t4, mstatus",
+        "sw {magic}, 0({base})",
+        "sw t0, 4({base})",
+        "sw t1, 8({base})",
+        "sw t2, 12({base})",
+        "sw {trap_frame}, 16({base})",
+        "sw sp, 20({base})",
+        "sw t3, 24({base})",
+        "sw t4, 28({base})",
+        base = in(reg) base,
+        magic = in(reg) 0x4850_4d45u32,
+        trap_frame = in(reg) trap_frame,
+        out("t0") _,
+        out("t1") _,
+        out("t2") _,
+        out("t3") _,
+        out("t4") _,
+        options(nostack),
+    );
 }

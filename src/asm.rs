@@ -109,8 +109,47 @@ _hpm_start:
 "#
 );
 
-// Pre-init trap handler - simple infinite loop
-// Used during early boot before the real trap handler is set up
+// Pre-init trap handler with an optional retained fault record.
+#[cfg(feature = "diagnostics")]
+global_asm!(
+    r#"
+    .section .uninit.hpm_trap_record, "aw", @nobits
+    .global __hpm_preinit_trap_record
+    .type __hpm_preinit_trap_record, @object
+    .balign 4
+__hpm_preinit_trap_record:
+    .zero 32
+    .size __hpm_preinit_trap_record, . - __hpm_preinit_trap_record
+
+    .section .init, "ax"
+    .global _pre_init_trap
+    .type _pre_init_trap, @function
+    .balign 4
+
+_pre_init_trap:
+    la t0, __hpm_preinit_trap_record
+    li t1, 0x48504d54
+    sw t1, 0(t0)
+    csrr t1, mcause
+    sw t1, 4(t0)
+    csrr t1, mepc
+    sw t1, 8(t0)
+    csrr t1, mtval
+    sw t1, 12(t0)
+    sw ra, 16(t0)
+    sw sp, 20(t0)
+    csrr t1, mtvec
+    sw t1, 24(t0)
+    csrr t1, mstatus
+    sw t1, 28(t0)
+1:
+    j 1b
+
+    .size _pre_init_trap, . - _pre_init_trap
+"#
+);
+
+#[cfg(not(feature = "diagnostics"))]
 global_asm!(
     r#"
     .section .init, "ax"
